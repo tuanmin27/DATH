@@ -99,52 +99,6 @@ class BernoulliRBM(nn.Module):
 
         return pos, neg, v0, pv1, ph0, ph1
 
-class GaussianTopRBM(nn.Module):
-
-    def __init__(self, n_vis, n_hid):
-        super().__init__()
-        self.n_vis = n_vis
-        self.n_hid = n_hid
-
-        self.W = nn.Parameter(0.01 * torch.randn(n_vis, n_hid))
-        self.bv = nn.Parameter(torch.zeros(n_vis))
-        self.bh = nn.Parameter(torch.zeros(n_hid))
-
-    # mean của hidden Gaussian, dùng như "p(h|v)"
-    def p_h_given_v(self, v):
-        # Không sigmoid, vì hidden là Gaussian linear
-        return v @ self.W + self.bh       # [B, n_hid]
-
-    def sample_h(self, v):
-        mean = self.p_h_given_v(v)
-        h = mean + torch.randn_like(mean)  # N(mean, 1)
-        return h, mean
-
-    def p_v_given_h(self, h):
-        # visible logistic
-        return torch.sigmoid(h @ self.W.t() + self.bv)
-
-    def sample_v(self, h):
-        pv = self.p_v_given_h(h)
-        v = torch.bernoulli(pv)
-        return v, pv
-
-    def cd1_step(self, v0):
-        # ----- Positive phase -----
-        h0, mean0 = self.sample_h(v0)
-
-        # ----- Negative phase -----
-        v1, pv1 = self.sample_v(h0)
-        h1, mean1 = self.sample_h(v1)
-
-        # Dùng mean (kỳ vọng) để tính pos/neg
-        pos = v0.t() @ mean0
-        neg = v1.t() @ mean1
-
-        # Trả về mean0/mean1 như ph0/ph1 cho train_rbm()
-        return pos, neg, v0, pv1, mean0, mean1
-
-
 # ======================
 # Training RBM
 # ======================
@@ -245,7 +199,7 @@ def main():
 
     # ---------- RBM4: 250 -> 30 ----------
     rbm4 = BernoulliRBM(250, 30)
-    rbm4 = train_rbm(rbm4, loader4, steps=STEPS_RBM4, lr=LR_RBM, name="Top RBM (Gaussian) 250->30")
+    rbm4 = train_rbm(rbm4, loader4, steps=STEPS_RBM4, lr=LR_RBM, name="RBM4 250->30")
 
     # Save RBMs
     os.makedirs("checkpoints", exist_ok=True)

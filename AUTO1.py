@@ -19,7 +19,7 @@ SEED = 0
 BATCH = 128
 LR_RBM = 0.05
 AE_SIZES = (784, 1000, 500, 250, 30)
-EPOCHS_AE = 20
+EPOCHS_AE = 10
 N_CG = 10000
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -174,7 +174,7 @@ def fine_tune_with_cg(model, X, epochs=20):
     model.to(DEVICE)
     model.train()
 
-    criterion = nn.BCELoss()
+    criterion = nn.MSELoss()
 
     optimizer = optim.LBFGS(
         model.parameters(),
