@@ -1,110 +1,276 @@
-
-"""
-AUTO.py - Entry script: RBM pretraining -> init AE -> fine-tune
-Bổ sung:
-- Lưu checkpoint mỗi epoch: outputs/checkpoints/ae_epochXXX.pt
-- Ghi log loss theo epoch:  outputs/loss_log.csv
-- Lưu hình tái tạo:        outputs/recon_rbm.png
-"""
-
 import os
-import csv
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader, TensorDataset
 
-# Import pipeline components từ file RBM
-from rbm_autoencoder import (
-    BernoulliRBM, train_rbm, transform_with_rbm,
-    AE, initialize_ae_from_rbms,
-    DEVICE, train_loader
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+
+import matplotlib.pyplot as plt
+
+
+# ======================
+# Config (must match pretrain_rbm.py)
+# ======================
+
+SEED = 0
+BATCH = 128
+LR_RBM = 0.05
+AE_SIZES = (784, 1000, 500, 250, 30)
+EPOCHS_AE = 20
+N_CG = 10000
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", DEVICE)
+
+torch.manual_seed(SEED)
+
+
+# ======================
+# Dataset MNIST (for fine-tuning + visualization)
+# ======================
+
+def flatten(x):
+    return x.view(-1)   # 28x28 => 784
+
+
+tfm = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Lambda(flatten)
+])
+
+train_ds = datasets.MNIST(
+    root="./data",
+    train=True,
+    download=True,
+    transform=tfm
 )
 
-# ------------------- Config -------------------
-EPOCHS_AE = 5
-LR_FT     = 1e-3
-CKPT_DIR  = "outputs/checkpoints"
-LOG_CSV   = "outputs/loss_log.csv"
-IMG_PATH  = "outputs/recon_rbm.png"
+train_loader = DataLoader(
+    train_ds,
+    batch_size=BATCH,
+    shuffle=True,
+    num_workers=0,
+    pin_memory=True
+)
 
-os.makedirs(CKPT_DIR, exist_ok=True)
-os.makedirs(os.path.dirname(LOG_CSV), exist_ok=True)
+print("Train size:", len(train_ds))
 
-def fine_tune_with_logging(ae, train_loader, epochs=5, lr=1e-3, log_csv=LOG_CSV, ckpt_dir=CKPT_DIR):
-    crit = nn.BCELoss()
-    opt  = optim.Adam(ae.parameters(), lr=lr)
 
-    # Prepare CSV
-    with open(log_csv, "w", newline="") as f:
-        w = csv.writer(f); w.writerow(["epoch", "train_loss"])
+# ======================
+# RBM definition (same as in pretrain_rbm.py)
+#   -> used only to hold weights loaded from checkpoints
+# ======================
 
-    for epoch in range(1, epochs+1):
-        ae.train()
-        total = n = 0
-        for x, _ in train_loader:
-            x = x.to(DEVICE, non_blocking=True)
-            x_hat, _ = ae(x)
-            loss = crit(x_hat, x)
-            opt.zero_grad(); loss.backward(); opt.step()
-            bs = x.size(0); total += loss.item() * bs; n += bs
-        train_loss = total / n
-        print(f"[AE fine-tune] epoch {epoch}/{epochs}  train_loss={train_loss:.4f}")
+class BernoulliRBM(nn.Module):
 
-        # Save checkpoint per epoch
-        ckpt_path = os.path.join(ckpt_dir, f"ae_epoch{epoch:03d}.pt")
-        torch.save({
-            "epoch": epoch,
-            "model_state": ae.state_dict(),
-            "optimizer_state": opt.state_dict(),
-            "config": {"epochs": epochs, "lr": lr}
-        }, ckpt_path)
-        print("Saved checkpoint:", ckpt_path)
+    def __init__(self, n_vis, n_hid):
+        super().__init__()
+        self.n_vis = n_vis
+        self.n_hid = n_hid
 
-        # Append log
-        with open(log_csv, "a", newline="") as f:
-            w = csv.writer(f); w.writerow([epoch, train_loss])
+        self.W = nn.Parameter(torch.zeros(n_vis, n_hid))
+        self.bv = nn.Parameter(torch.zeros(n_vis))
+        self.bh = nn.Parameter(torch.zeros(n_hid))
 
-def save_recon_grid(ae, loader, out_path=IMG_PATH, n=10):
-    ae.eval()
+    def p_h_given_v(self, v):
+        return torch.sigmoid(v @ self.W + self.bh)
+
+    def p_v_given_h(self, h):
+        return torch.sigmoid(h @ self.W.t() + self.bv)
+
+
+# ======================
+# Autoencoder
+# ======================
+
+class AE(nn.Module):
+    def __init__(self, sizes=(784, 1000, 500, 250, 30)):
+        super().__init__()
+        d, h1, h2, h3, code = sizes
+
+        # Encoder
+        self.enc1 = nn.Linear(d,   h1)
+        self.enc2 = nn.Linear(h1,  h2)
+        self.enc3 = nn.Linear(h2,  h3)
+        self.enc4 = nn.Linear(h3,  code)   # code layer (linear)
+
+        # Decoder (symmetric)
+        self.dec4 = nn.Linear(code, h3)
+        self.dec3 = nn.Linear(h3,   h2)
+        self.dec2 = nn.Linear(h2,   h1)
+        self.dec1 = nn.Linear(h1,   d)
+
+        # Activation: logistic, output logistic
+        self.act = nn.Sigmoid()
+        self.out = nn.Sigmoid()
+
+    def forward(self, x):
+        # Encoder
+        z1 = self.act(self.enc1(x))   # 1000 logistic
+        z2 = self.act(self.enc2(z1))  # 500 logistic
+        z3 = self.act(self.enc3(z2))  # 250 logistic
+        code = self.enc4(z3)          # 30 linear
+
+        # Decoder
+        y3 = self.act(self.dec4(code))
+        y2 = self.act(self.dec3(y3))
+        y1 = self.act(self.dec2(y2))
+        y  = self.out(self.dec1(y1))  # logistic output
+
+        return y, code
+
+
+# ======================
+# Initialize AE from RBMs
+# ======================
+
+def initialize_ae_from_rbms(ae, rbms):
+    rbm1, rbm2, rbm3, rbm4 = rbms
+
     with torch.no_grad():
-        x, _ = next(iter(loader))
-        x = x.to(DEVICE)
-        x_hat, _ = ae(x)
-    fig, axes = plt.subplots(2, n, figsize=(n*1.2, 3.0))
-    for i in range(n):
-        axes[0, i].imshow(x[i].cpu().view(28,28), cmap="gray"); axes[0, i].axis("off")
-        axes[1, i].imshow(x_hat[i].cpu().view(28,28), cmap="gray"); axes[1, i].axis("off")
-    fig.suptitle("Top: Original — Bottom: Reconstruction (RBM-pretrained AE)", y=1.02)
-    plt.tight_layout(); plt.savefig(out_path, dpi=200); plt.close(fig)
-    print("Saved image:", out_path)
+        # encoder 1: 784 -> 1000
+        ae.enc1.weight.copy_(rbm1.W.t())
+        ae.enc1.bias.copy_(rbm1.bh)
+
+        # encoder 2: 1000 -> 500
+        ae.enc2.weight.copy_(rbm2.W.t())
+        ae.enc2.bias.copy_(rbm2.bh)
+
+        # encoder 3: 500 -> 250
+        ae.enc3.weight.copy_(rbm3.W.t())
+        ae.enc3.bias.copy_(rbm3.bh)
+
+        # encoder 4 (code): 250 -> 30
+        ae.enc4.weight.copy_(rbm4.W.t())
+        ae.enc4.bias.copy_(rbm4.bh)
+
+        # decoder 4: 30 -> 250
+        ae.dec4.weight.copy_(rbm4.W)
+        ae.dec4.bias.copy_(rbm4.bv)
+
+        # decoder 3: 250 -> 500
+        ae.dec3.weight.copy_(rbm3.W)
+        ae.dec3.bias.copy_(rbm3.bv)
+
+        # decoder 2: 500 -> 1000
+        ae.dec2.weight.copy_(rbm2.W)
+        ae.dec2.bias.copy_(rbm2.bv)
+
+        # decoder 1: 1000 -> 784
+        ae.dec1.weight.copy_(rbm1.W)
+        ae.dec1.bias.copy_(rbm1.bv)
+
+    print("Initialized DeepAE from 4 stacked RBMs.")
+
+
+# ======================
+# Fine-tune with LBFGS (CG-like)
+# ======================
+
+def fine_tune_with_cg(model, X, epochs=20):
+    model.to(DEVICE)
+    model.train()
+
+    criterion = nn.BCELoss()
+
+    optimizer = optim.LBFGS(
+        model.parameters(),
+        lr=1.0,
+        max_iter=20,
+        history_size=50
+    )
+
+    loss_history = []
+
+    for epoch in range(1, epochs + 1):
+        def closure():
+            optimizer.zero_grad()
+            y_hat, _ = model(X)
+            loss = criterion(y_hat, X)
+            loss.backward()
+            return loss
+
+        loss = optimizer.step(closure)
+        loss_history.append(loss.detach())
+        print(f"[CG] epoch {epoch}/{epochs} | loss = {loss.item():.6f}")
+
+    return model, loss_history
+
 
 def main():
-    # 1) Train RBM1 (784->256)
-    rbm1 = BernoulliRBM(784, 256)
-    rbm1 = train_rbm(rbm1, train_loader, steps=800, lr=0.05, name="RBM1 784->256")
+    # Build X_cg: first N_CG training images
+    X_cg_list = []
+    for i in range(N_CG):
+        x, _ = train_ds[i]
+        X_cg_list.append(x)
 
-    # 2) Features cho RBM2
-    print("Building hidden features from RBM1 for RBM2...")
-    H = transform_with_rbm(rbm1, train_loader)
-    hid_ds = TensorDataset(H, torch.zeros(len(H)))
-    hid_loader = DataLoader(hid_ds, batch_size=128, shuffle=True, num_workers=0)
+    X_cg = torch.stack(X_cg_list, dim=0).to(DEVICE)  # [N_CG, 784]
+    print("X_cg shape:", X_cg.shape)
 
-    # 3) Train RBM2 (256->64)
-    rbm2 = BernoulliRBM(256, 64)
-    rbm2 = train_rbm(rbm2, hid_loader, steps=800, lr=0.05, name="RBM2 256->64")
+    # Load pretrained RBMs
+    ckpt_dir = "checkpoints"
+    rbm1 = BernoulliRBM(784, 1000)
+    rbm2 = BernoulliRBM(1000, 500)
+    rbm3 = BernoulliRBM(500, 250)
+    rbm4 = BernoulliRBM(250, 30)
 
-    # 4) Init AE từ RBMs
-    ae = AE((784,256,64)).to(DEVICE)
-    initialize_ae_from_rbms(ae, rbm1, rbm2)
-    print("Initialized AE from stacked RBMs. Starting fine-tuning...")
+    rbm1.load_state_dict(torch.load(os.path.join(ckpt_dir, "rbm1_784_1000.pth"), map_location=DEVICE))
+    rbm2.load_state_dict(torch.load(os.path.join(ckpt_dir, "rbm2_1000_500.pth"), map_location=DEVICE))
+    rbm3.load_state_dict(torch.load(os.path.join(ckpt_dir, "rbm3_500_250.pth"), map_location=DEVICE))
+    rbm4.load_state_dict(torch.load(os.path.join(ckpt_dir, "rbm4_250_30.pth"), map_location=DEVICE))
 
-    # 5) Fine-tune + log + checkpoint
-    fine_tune_with_logging(ae, train_loader, epochs=EPOCHS_AE, lr=LR_FT)
+    rbms = [rbm1.to(DEVICE), rbm2.to(DEVICE), rbm3.to(DEVICE), rbm4.to(DEVICE)]
 
-    # 6) Lưu ảnh tái tạo
-    save_recon_grid(ae, train_loader, out_path=IMG_PATH)
+    # Build AE, initialize from RBMs
+    deep_ae = AE(AE_SIZES).to(DEVICE)
+    initialize_ae_from_rbms(deep_ae, rbms)
+
+    # Fine-tune
+    deep_ae, loss_history = fine_tune_with_cg(deep_ae, X_cg, epochs=EPOCHS_AE)
+
+    # ---- Plot a few reconstructions ----
+    deep_ae.eval()
+    with torch.no_grad():
+        batch = next(iter(train_loader))[0].to(DEVICE)
+        recon, _ = deep_ae(batch)
+
+    batch = batch.cpu().view(-1, 28, 28)
+    recon = recon.cpu().view(-1, 28, 28)
+
+    n = 10
+    plt.figure(figsize=(2*n, 4))
+
+    for i in range(n):
+        # Original
+        plt.subplot(2, n, i + 1)
+        plt.imshow(batch[i], cmap="gray")
+        plt.axis("off")
+        if i == 0:
+            plt.title("Original")
+
+        # Reconstructed
+        plt.subplot(2, n, n + i + 1)
+        plt.imshow(recon[i], cmap="gray")
+        plt.axis("off")
+        if i == 0:
+            plt.title("Reconstructed")
+
+    plt.tight_layout()
+    plt.show()
+
+    # ---- Plot loss ----
+    plt.figure(figsize=(6, 4))
+    plot_losses = [loss.cpu().item() for loss in loss_history]
+    plt.plot(range(1, len(plot_losses) + 1), plot_losses, marker="o")
+    plt.xlabel("Epoch")
+    plt.ylabel("Training Loss (BCE)")
+    plt.title("AE Fine-tuning Loss per Epoch")
+    plt.grid(True)
+    plt.show()
+
 
 if __name__ == "__main__":
     main()
